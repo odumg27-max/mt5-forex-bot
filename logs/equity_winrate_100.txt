@@ -1,0 +1,1 @@
+{'trades': 428, 'wins': 127, 'losses': 296, 'be_or_to': 5, 'winrate': 30.023640661938533, 'total_R': 85.0, 'final_equity': 217.94411092745844}

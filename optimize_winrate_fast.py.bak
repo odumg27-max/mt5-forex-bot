@@ -1,0 +1,289 @@
+﻿import itertools, numpy as np, pandas as pd, MetaTrader5 as mt5
+from datetime import datetime, timedelta, timezone
+from bot_mt5 import init_mt5, add_indicators, SYMBOL
+
+try:
+    from zoneinfo import ZoneInfo
+    LAGOS = ZoneInfo("Africa/Lagos")
+except Exception:
+    from datetime import timedelta, timezone
+    LAGOS = timezone(timedelta(hours=1))
+
+TF = {"M1": mt5.TIMEFRAME_M1, "M15": mt5.TIMEFRAME_M15, "H1": mt5.TIMEFRAME_H1}
+
+def rates_range_df(symbol, tf_key, days):
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(days=days+7)
+    rates = mt5.copy_rates_range(symbol, TF[tf_key], start, now)
+    if rates is None or len(rates)==0: return pd.DataFrame()
+    df = pd.DataFrame(rates)
+    df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
+    df.set_index("time", inplace=True)
+    return df[["open","high","low","close","tick_volume"]].rename(columns={"tick_volume":"volume"})
+
+def rsi(series: pd.Series, n: int = 14) -> pd.Series:
+    s = pd.Series(series, dtype="float64")
+    delta = s.diff()
+    up = delta.clip(lower=0); dn = -delta.clip(upper=0)
+    ru = up.ewm(alpha=1/max(n,1), adjust=False).mean()
+    rd = dn.ewm(alpha=1/max(n,1), adjust=False).mean()
+    rs = ru / (rd.replace(0, np.nan))
+    return 100 - (100 / (1 + rs))
+
+def build_components(h1i, m15i, m1i):
+    comps = {}
+    comps["ema50_gt_200_h1"] = (h1i["ema50"] > h1i["ema200"])
+    comps["ema50_lt_200_h1"] = (h1i["ema50"] < h1i["ema200"])
+    comps["adx_h1"] = h1i["adx14"]
+
+    prior_high = m15i["high"].rolling(20).max().shift(1)
+    prior_low  = m15i["low"].rolling(20).min().shift(1)
+    comps["bos_up_raw"]   = (m15i["close"] > prior_high)
+    comps["bos_down_raw"] = (m15i["close"] < prior_low)
+
+    comps["ema_up"]   = (m1i["ema9"]>m1i["ema21"]) & (m1i["ema21"]>m1i["ema50"])
+    comps["ema_down"] = (m1i["ema9"]<m1i["ema21"]) & (m1i["ema21"]<m1i["ema50"])
+    comps["macd_up"]   = (m1i["macdh"]>0) & (m1i["macdh"]>m1i["macdh"].shift(1))
+    comps["macd_down"] = (m1i["macdh"]<0) & (m1i["macdh"]<m1i["macdh"].shift(1))
+    comps["st_up"]    = (m1i["st_dir"]==1)
+    comps["st_down"]  = (m1i["st_dir"]==-1)
+    comps["adx_m1"]   = m1i["adx14"]
+    comps["vol_ratio"]= m1i["volume"] / m1i["vol_ma20"]
+    comps["atr14"]    = m1i["atr14"]
+    comps["close"]    = m1i["close"]
+    comps["ema21"]    = m1i["ema21"]
+    comps["high"]     = m1i["high"]
+    comps["low"]      = m1i["low"]
+    comps["rsi"]      = rsi(m1i["close"], 14)
+    return comps
+
+def rolling_windows_forward(a: np.ndarray, win: int) -> np.ndarray:
+    """Return view of forward windows a[i+1:i+1+win] with shape (n,win). Pads tail with NaN."""
+    n = a.shape[0]
+    pad = np.full(win, np.nan, dtype=a.dtype)
+    b = np.concatenate([a[1:], pad])  # shift by 1 so next bar is column 0
+    # as_strided view
+    from numpy.lib.stride_tricks import as_strided
+    return as_strided(b, shape=(n, win), strides=(b.strides[0], b.strides[0]))
+
+def precompute_outcomes(m1i: pd.DataFrame, lookahead: int):
+    """Precompute result R for a long/short entry on each bar using 1:3 RR, ATR 1.5 SL."""
+    c = m1i["close"].to_numpy(dtype=np.float64)
+    a = m1i["atr14"].to_numpy(dtype=np.float64)
+    h = m1i["high"].to_numpy(dtype=np.float64)
+    l = m1i["low"].to_numpy(dtype=np.float64)
+
+    tp_long  = c + 4.5*a
+    sl_long  = c - 1.5*a
+    tp_short = c - 4.5*a
+    sl_short = c + 1.5*a
+
+    H = rolling_windows_forward(h, lookahead)
+    L = rolling_windows_forward(l, lookahead)
+
+    # Long outcomes
+    tp_hit_L = (H >= tp_long.reshape(-1,1))
+    sl_hit_L = (L <= sl_long.reshape(-1,1))
+    tp_any_L = tp_hit_L.any(axis=1)
+    sl_any_L = sl_hit_L.any(axis=1)
+    first_tp_L = np.where(tp_any_L, tp_hit_L.argmax(axis=1), np.iinfo(np.int32).max)
+    first_sl_L = np.where(sl_any_L, sl_hit_L.argmax(axis=1), np.iinfo(np.int32).max)
+    res_long = np.where(~tp_any_L & ~sl_any_L, 0.0,
+                 np.where(tp_any_L & ~sl_any_L, 3.0,
+                 np.where(~tp_any_L & sl_any_L, -1.0,
+                 np.where(first_tp_L <= first_sl_L, 3.0, -1.0))))
+
+    # Short outcomes
+    tp_hit_S = (L <= tp_short.reshape(-1,1))
+    sl_hit_S = (H >= sl_short.reshape(-1,1))
+    tp_any_S = tp_hit_S.any(axis=1)
+    sl_any_S = sl_hit_S.any(axis=1)
+    first_tp_S = np.where(tp_any_S, tp_hit_S.argmax(axis=1), np.iinfo(np.int32).max)
+    first_sl_S = np.where(sl_any_S, sl_hit_S.argmax(axis=1), np.iinfo(np.int32).max)
+    res_short = np.where(~tp_any_S & ~sl_any_S, 0.0,
+                  np.where(tp_any_S & ~sl_any_S, 3.0,
+                  np.where(~tp_any_S & sl_any_S, -1.0,
+                  np.where(first_tp_S <= first_sl_S, 3.0, -1.0))))
+
+    # Mask bars with invalid ATR
+    valid_atr = np.isfinite(a) & (a > 0)
+    res_long = np.where(valid_atr, res_long, 0.0)
+    res_short= np.where(valid_atr, res_short, 0.0)
+    return res_long, res_short
+
+def evaluate_combo_fast(comps, m1i, res_long, res_short, *,
+                        adx_min_h1, adx_min_m1, vol_mult,
+                        bos_window_m15, ema_align_bars,
+                        pullback_k_atr, rsi_mode,
+                        session_start, session_end,
+                        entry_mode, warmup=350):
+    # H1 gating → M1
+    h1_up   = comps["ema50_gt_200_h1"] & (comps["adx_h1"] > adx_min_h1)
+    h1_down = comps["ema50_lt_200_h1"] & (comps["adx_h1"] > adx_min_h1)
+    h1_up_m1   = h1_up.reindex(m1i.index, method="ffill").fillna(False).to_numpy()
+    h1_down_m1 = h1_down.reindex(m1i.index, method="ffill").fillna(False).to_numpy()
+
+    # BOS recent
+    prior_bos_up = comps["bos_up_raw"].rolling(bos_window_m15).max().astype(bool)
+    prior_bos_dn = comps["bos_down_raw"].rolling(bos_window_m15).max().astype(bool)
+    bos_up_m1   = prior_bos_up.reindex(m1i.index, method="ffill").fillna(False).to_numpy()
+    bos_dn_m1   = prior_bos_dn.reindex(m1i.index, method="ffill").fillna(False).to_numpy()
+
+    # EMA persistence
+    ema_up_sus = comps["ema_up"].rolling(ema_align_bars).apply(lambda x: float(x.all()), raw=False).astype(bool).to_numpy()
+    ema_dn_sus = comps["ema_down"].rolling(ema_align_bars).apply(lambda x: float(x.all()), raw=False).astype(bool).to_numpy()
+
+    # RSI bias
+    if rsi_mode == "bias":
+        rsi_up_ok = (comps["rsi"] >= 55).to_numpy()
+        rsi_dn_ok = (comps["rsi"] <= 45).to_numpy()
+    else:
+        rsi_up_ok = np.ones(len(m1i), dtype=bool)
+        rsi_dn_ok = np.ones(len(m1i), dtype=bool)
+
+    # ADX/Vol on M1
+    adx_ok = (comps["adx_m1"] > adx_min_m1).to_numpy()
+    vol_ok = (comps["vol_ratio"] > vol_mult).to_numpy()
+
+    # Donchian breakout
+    dch = m1i["high"].rolling(15).max()
+    dcl = m1i["low"].rolling(15).min()
+    brk_up = ((m1i["close"]>dch) & (m1i["close"].shift(1)<=dch.shift(1))).fillna(False).to_numpy()
+    brk_dn = ((m1i["close"]<dcl) & (m1i["close"].shift(1)>=dcl.shift(1))).fillna(False).to_numpy()
+
+    # Pullback to EMA21 within k*ATR
+    pb_up = (ema_up_sus & adx_ok & rsi_up_ok &
+             (np.abs((m1i["close"]-m1i["ema21"]).to_numpy()) <= (pullback_k_atr * m1i["atr14"].to_numpy())) &
+             (vol_ok) & comps["st_up"].to_numpy())
+    pb_dn = (ema_dn_sus & adx_ok & rsi_dn_ok &
+             (np.abs((m1i["close"]-m1i["ema21"]).to_numpy()) <= (pullback_k_atr * m1i["atr14"].to_numpy())) &
+             (vol_ok) & comps["st_down"].to_numpy())
+
+    long_brk   = ema_up_sus  & adx_ok & vol_ok & rsi_up_ok  & brk_up  & comps["st_up"].to_numpy()
+    short_brk  = ema_dn_sus  & adx_ok & vol_ok & rsi_dn_ok  & brk_dn  & comps["st_down"].to_numpy()
+    long_momo  = ema_up_sus  & comps["macd_up"].to_numpy()  & adx_ok & vol_ok & rsi_up_ok  & comps["st_up"].to_numpy()
+    short_momo = ema_dn_sus  & comps["macd_down"].to_numpy()& adx_ok & vol_ok & rsi_dn_ok  & comps["st_down"].to_numpy()
+
+    if entry_mode == "pullback":
+        long_core, short_core = pb_up, pb_dn
+    elif entry_mode == "breakout":
+        long_core, short_core = long_brk, short_brk
+    else:
+        long_core, short_core = (pb_up | long_brk | long_momo), (pb_dn | short_brk | short_momo)
+
+    # Lagos session filter
+    idx_lagos = m1i.index.tz_convert(LAGOS)
+    in_sess = ((idx_lagos.hour.values >= session_start) & (idx_lagos.hour.values < session_end))
+
+    valid = np.ones(len(m1i), dtype=bool); valid[:warmup] = False
+    long_sig  = valid & in_sess & h1_up_m1   & bos_up_m1   & long_core
+    short_sig = valid & in_sess & h1_down_m1 & bos_dn_m1   & short_core
+
+    # Use precomputed outcomes
+    resL = res_long[long_sig]
+    resS = res_short[short_sig]
+    allR = np.concatenate([resL, resS])
+    trades = allR.size
+    if trades == 0:
+        return {"trades":0,"wins":0,"losses":0,"pnl_R":0.0,"winrate":0.0}
+    wins = int((allR>0).sum()); losses = int((allR<0).sum()); pnl_R = float(allR.sum())
+    winrate = 100.0*wins/trades
+    return {"trades":trades,"wins":wins,"losses":losses,"pnl_R":pnl_R,"winrate":winrate}
+
+def main(days=45, warmup=350, lookahead=120, topk=10, min_trades=25, quick=True):
+    init_mt5()
+    sym = SYMBOL
+    print(f"FAST optimizer on {sym} — days={days}, lookahead={lookahead} (precomputing outcomes once)")
+
+    # Fetch once
+    h1 = rates_range_df(sym,"H1",days); m15 = rates_range_df(sym,"M15",days); m1 = rates_range_df(sym,"M1",days)
+    if h1.empty or m15.empty or m1.empty:
+        print("Not enough bars. Open charts or increase days."); return
+
+    # Indicators once
+    h1i = add_indicators(h1); m15i = add_indicators(m15); m1i = add_indicators(m1)
+    comps = build_components(h1i, m15i, m1i)
+
+    # Precompute per-bar outcomes (long & short) — heavy step but done ONCE
+    print("Precomputing outcomes…")
+    global res_long, res_short
+    res_long, res_short = precompute_outcomes(m1i, lookahead)
+
+    # Small, high-impact grid (fast). Set quick=False for a bit wider search.
+    grid_quick = dict(
+        adx_min_h1=[20,22],
+        adx_min_m1=[18,20],
+        vol_mult=[1.00,1.05],
+        bos_window_m15=[2,3],
+        ema_align_bars=[2,3],
+        pullback_k_atr=[0.25,0.35],
+        rsi_mode=["off","bias"],
+        session_start=[8],
+        session_end=[18],
+        entry_mode=["pullback","either"],
+    )
+    grid_wide = dict(
+        adx_min_h1=[20,22,24],
+        adx_min_m1=[18,20,22],
+        vol_mult=[0.98,1.00,1.05],
+        bos_window_m15=[2,3,4],
+        ema_align_bars=[2,3,4],
+        pullback_k_atr=[0.2,0.3,0.4],
+        rsi_mode=["off","bias"],
+        session_start=[7,8],
+        session_end=[17,18],
+        entry_mode=["pullback","either","breakout"],
+    )
+    grid = grid_quick if quick else grid_wide
+
+    keys = list(grid.keys())
+    combos = list(itertools.product(*(grid[k] for k in keys)))
+
+    results = []
+    for vals in combos:
+        params = dict(zip(keys, vals))
+        res = evaluate_combo_fast(comps, m1i, res_long, res_short, warmup=warmup, **params)
+        row = {**params, **res}
+        if row["trades"] >= min_trades:
+            results.append(row)
+
+    if not results:
+        print("No combos met min_trades. Try quick=False or lower min_trades.")
+        return
+
+    df = pd.DataFrame(results).sort_values(["winrate","trades","pnl_R"], ascending=[False, False, False]).reset_index(drop=True)
+    print("\n=== TOP BY WIN RATE (FAST) ===")
+    print(df.head(topk).to_string(index=True, float_format=lambda x: f"{x:.2f}"))
+
+    # Print a ready-to-run command for backtest_winrate_focus.py using best row
+    best = df.iloc[0].to_dict()
+    cmd = (
+        "python .\\backtest_winrate_focus.py "
+        f"--days {days} --warmup {warmup} --lookahead {lookahead} --max_trades 300 "
+        f"--adx_min_h1 {int(best['adx_min_h1'])} --adx_min_m1 {int(best['adx_min_m1'])} "
+        f"--vol_mult {best['vol_mult']} --don_len 15 --bos_window_m15 {int(best['bos_window_m15'])} "
+        f"--rsi_len 14 --rsi_up 55 --rsi_dn 45 --ema_align_bars {int(best['ema_align_bars'])} "
+        f"--pullback_k_atr {best['pullback_k_atr']} --entry_mode {best['entry_mode']} --supertrend_req"
+    )
+    print("\n=== REPLAY BEST CONFIG ===")
+    print(cmd)
+
+    # Save all results
+    import os
+    os.makedirs("logs", exist_ok=True)
+    out_csv = "logs/optimize_winrate_fast_results.csv"
+    df.to_csv(out_csv, index=False)
+    print(f"\nSaved: {out_csv}")
+
+if __name__ == "__main__":
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--days", type=int, default=45)          # smaller window = faster
+    ap.add_argument("--warmup", type=int, default=350)
+    ap.add_argument("--lookahead", type=int, default=120)    # smaller = faster
+    ap.add_argument("--topk", type=int, default=10)
+    ap.add_argument("--min_trades", type=int, default=25)
+    ap.add_argument("--quick", action="store_true")
+    ap.add_argument("--wide", dest="quick", action="store_false")
+    args = ap.parse_args()
+    main(**vars(args))
