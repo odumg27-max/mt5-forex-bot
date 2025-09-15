@@ -1,0 +1,15 @@
+﻿.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.vscode/
+.idea/
+
+# Generated artifacts
+.env
+*.env
+logs/
+reports/
+*.log
+*.csv
+*.tsv
